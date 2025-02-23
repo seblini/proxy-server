@@ -2,7 +2,6 @@ from socket import *
 import sys
 import select
 import queue
-import ssl
 
 def main():
 	if len(sys.argv) <= 1:
@@ -10,127 +9,234 @@ def main():
 		sys.exit(2)
 		
 	# The proxy server is listening at 8888 
-	server = socket(AF_INET, SOCK_STREAM)
-	server.setblocking(False)
-	server.bind((sys.argv[1], 8888))
-	server.listen(100)
+	proxy_sock = socket(AF_INET, SOCK_STREAM)
+	proxy_sock.setblocking(False)
+	proxy_sock.bind((sys.argv[1], 8888))
+	proxy_sock.listen(100)
 
-	inputs = [server]
+	# Used to mark sockets that are expecting data to
+	# be sent to them
+	inputs = [proxy_sock]
+
+	# Used to mark sockets that want to send data
 	outputs = []
-	message_queues = {}
-	client_mappings = {}
 
-	# context = ssl.create_default_context()
+	# Maps from a socket's memory address to a queue
+	# that holds data that will later be sent
+	message_queues = {}
+
+	# Maps from a server socket's memory address to a
+	# client socket's memory address
+	server_mappings = {}
+
+	# Socket registry that maps from a socket's memory
+	# address to the socket itself
+	sock_reg = {}
 
 	def clean_up_sock(s):
+		"""	Removes any reference to a socket from all
+			collections then closes it.
+
+		Args:
+			s (socket): The socket.
+
+		Returns:
+			None
+		"""
+		sid = id(s)
 		if s in inputs:
 			inputs.remove(s)
 		if s in outputs:
 			outputs.remove(s)
-		if s in message_queues:
-			del message_queues[s]
+		if sid in message_queues:
+			del message_queues[sid]
+		if sid in sock_reg:
+			del sock_reg[sid]
+		if sid in server_mappings:
+			del server_mappings[sid]
 		s.close()
 
-	def handle_client(r, host, file):
+	def handle_new_client(r, data):
+		""" Creates a new server socket that will
+			forward the request sent to the client
+			socket.
+
+		Args:
+			r (socket): The cloent socket
+			data (bytes): The request
+
+		Returns:
+			None
+		"""
+		# Decode the data and retrieve the headers
+		msg = data.decode()
+		headers = msg.split('\r\n')
+
+		# Retrieve the path from the first header
+		url_components = headers[0].split(' ')[1].split('/')
+
+		# The hostname will be the first non-empty component
+		host = url_components[1]
+
+		# Anything after that will be the file
+		file = '' if len(url_components) < 3 else '/'.join(url_components[2:])
+
+		# Check that the hostname is valid and retrieve
+		# its address
 		sockaddr = None
 		try:
-			addrinfo = getaddrinfo(host=host, port=80, family=AF_INET, type=SOCK_STREAM)
+			addrinfo = getaddrinfo(
+				host=host,
+				port=80,
+				family=AF_INET,
+				type=SOCK_STREAM
+			)
 			sockaddr = addrinfo[0][-1]
 		except:
 			pass
 
+		# If the hostname is not valid clean up the
+		# the client socket
 		if not sockaddr:
 			clean_up_sock(r)
 			return
 
-		sock = socket(AF_INET, SOCK_STREAM)
-		sock.setblocking(False)
-		sock.settimeout(False)
+		# Initialize the socket and connect to the socket
+		server_sock = socket(AF_INET, SOCK_STREAM)
+		server_sock.setblocking(False)
+		server_sock.settimeout(False)
 
 		try:
-			sock.connect(sockaddr)
+			server_sock.connect(sockaddr)
 		except:
 			pass
 
-		client_mappings[sock] = r
-		message_queues[sock] = queue.Queue()
+		cid = id(r)
+		sid = id(server_sock)
 
+		# Add new server socket to the registry
+		sock_reg[sid] = server_sock
+
+		# Create a mapping from the server socket to the
+		# client socket
+		server_mappings[sid] = cid
+
+		# Create an empty queue to hold requests that will
+		# be sent by the server socket
+		message_queues[sid] = queue.Queue()
+
+		# Add the server socket to the inputs list to notify
+		# select that we are expecting a response
+		inputs.append(server_sock)
+
+		# Modify the request to use the true hostname and path
 		request = (
 				f'GET /{file} HTTP/1.1\r\n'
 				f'Host: {host}\r\n'
+				f'Connection: close\r\n'
 				'\r\n'
 				).encode()
 
-		message_queues[sock].put(request)
-		inputs.append(sock)
-		if sock not in outputs:
-			outputs.append(sock)
+		# Add the request to the server socket's message queue
+		message_queues[sid].put(request)
 
-	def forward(r, data):
+		# Add the server socket to the outputs list to notify
+		# select that we want to send a request
+		if server_sock not in outputs:
+			outputs.append(server_sock)
+
+	def forward_response(s, data):
+		""" Forwards data sent to a server socket
+			to its corresponding client socket.
+
+		Args:
+			s (socket): The server socket
+			data (bytes): The data
+
+		Returns:
+			None
+		"""
 		try:
-			message_queues[client_mappings[r]].put(data)
-			if client_mappings[r] not in outputs:
-				outputs.append(client_mappings[r])
+			# Retrieve the server socket's corresponding
+			# client socket
+			cid = server_mappings[id(s)]
+
+			# Add the data to the client socket's message
+			# queue
+			message_queues[cid].put(data)
+
+			# Add the client socket to the outputs list to
+			# notify select that we want to send the data
+			if cid not in outputs:
+				outputs.append(sock_reg[cid])
 		except KeyError:
-			clean_up_sock(r)
-		
+			clean_up_sock(s)
+
 	while inputs:
+		# Call select to retrieve the sockets that are ready to be used
 		readable, writable, exceptional = select.select(inputs, outputs, inputs)
 
+		# Handle all socket that are ready to be read from
 		for r in readable:
-			if r is server:
-				conn, addr = server.accept()
-				conn.setblocking(False)
-				inputs.append(conn)
-				message_queues[conn] = queue.Queue()
+			# If a request is sent to the proxy socket, it is
+			# a new client looking to connect
+			if r is proxy_sock:
+				# Accept the connection as a new client socket
+				client_sock, addr = proxy_sock.accept()
+				client_sock.setblocking(False)
+				
+				cid = id(client_sock)
+
+				# Add the client socket to the registry
+				sock_reg[cid] = client_sock
+
+				# Add the client socket to the inputs list to
+				# notify select that we are expecting a request
+				inputs.append(client_sock)
+
+				# Create an empty queue to hold responses that
+				# will sent by the client socket
+				message_queues[cid] = queue.Queue()
 				continue
 
-			# print(r.getpeername(), end=' ')
-
 			try:
+				# Read the incoming data from the socket
 				data = r.recv(4096)
 			except (BrokenPipeError, ConnectionResetError):
 				clean_up_sock(r)
 				continue
 
+			# If the there is no data we close the connection
 			if not data:
 				clean_up_sock(r)
 				continue
 
-			try:
-				msg = data.decode()
-				headers = msg.split('\r\n')
-			except:
-				headers = []
+			# If we are receiving data to a server socket we
+			# must forward it to the corresponding client socket
+			if id(r) in server_mappings:
+				forward_response(r, data)
+				continue
 
-			# print([h[:min(len(h), 50)] for h in headers[:2]])
+			handle_new_client(r, data)
 
-			if len(headers) > 1 and headers[1] == 'Host: localhost:8888':
-				url_components = headers[0].split(' ')[1].split('/')
-				host = url_components[1]
-				file = '' if len(url_components) < 3 else '/'.join(url_components[2:]) + '/'
-				handle_client(r, host, file)
-			else:
-				forward(r, data)	
-
+		# Handle all sockets that are ready to be written to
 		for w in writable:
 			try:
-				# ip, port = w.getpeername()
-				# if port == 443:
-				# 	context.wrap_socket(w, server_hostname=ip)
-				w.send(message_queues[w].get_nowait())
+				# Retrieve the data to be sent from the socket's message queue
+				msg = message_queues[id(w)].get_nowait()
+
+				# Send the data
+				w.send(msg)
 			except queue.Empty:
 				outputs.remove(w)
 			except:
 				clean_up_sock(w)
-
+		
+		# Handle all exceptional sockets
 		for e in exceptional:
+			# Any sockets that fall into this category will be closed
 			clean_up_sock(e)	
 
-		# Extract the filename from the given message
-		
-		
-		
 		'''
 		## filetouse = ## FILL IN HERE...
 
